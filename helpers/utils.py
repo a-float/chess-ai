@@ -11,16 +11,19 @@ def parse_position(line):
     return f'{eval}, {d["fen"].strip()}, {first_pvs["line"].split()[0]}, {best_eval["depth"]}, {is_mate}'
 
 
-def parse_dataset(games_to_load: int, save_path: str):
+def parse_dataset(games_to_load: int, save_path: str, starts: str):
     t0 = time.time()
     with open("data/lichess_db_eval.json", "r") as f:
         with open(save_path, "w") as fw:
+            i = 0
             fw.write("eval,fen,next_move,depth,is_mate\n")
-            for i in range(games_to_load):
+            while i < games_to_load:
                 line = f.readline()
                 try:
                     x = parse_position(line)
-                    fw.write(x + "\n")
+                    if x.split(", ")[1].split()[1] == starts:
+                        fw.write(x + "\n")
+                        i += 1
                 except Exception as e:
                     print(f"Exception {e} while parsing line {line}")
                 if i * 10 % games_to_load == 0:

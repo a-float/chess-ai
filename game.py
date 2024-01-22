@@ -7,53 +7,142 @@ import torch
 from helpers.fen import fen_to_bitboard
 from helpers.neural_network import NeuralNetwork
 from time import time
+import numpy as np
+from abc import ABC, abstractmethod
+import datetime
 
 
-class NeuralEngine:
+class Engine(ABC):
+    def __init__(self, name):
+        self.name = name
+
+    @abstractmethod
+    def next_move(opponent_move: chess.Move):
+        """Return the best move to the opponents move"""
+
+    @abstractmethod
+    def reset(fen: str):
+        """Clear engine's inner state"""
+
+
+class RandomEngine(Engine):
     def __init__(self):
-        weights = torch.load("./models/200k_10e_2024_01_14.pt")
-        self.model = NeuralNetwork(input_shape=[6, 8, 8]).to("cpu")
+        super().__init__("Random Engine")
+        self.board = chess.Board()
+
+    def next_move(self, opponent_move: chess.Move) -> chess.Move:
+        if opponent_move:
+            self.board.push(opponent_move)
+        move = np.random.choice(list(self.board.legal_moves))
+        self.board.push(move)
+        return move
+
+    def reset(self, fen: str):
+        self.board = chess.Board(fen)
+
+
+class NeuralEngine(Engine):
+    def __init__(self, isWhite: bool, withMaterial=False):
+        super().__init__("Neural Engine")
+        self.isWhite = isWhite
+        weights = torch.load("./models/mil_20e_dropout.pt")
+        self.model = NeuralNetwork(input_shape=[12, 8, 8]).to("cpu")
         self.model.load_state_dict(weights)
         self.model.eval()
         self.board = chess.Board()
-        self.best_move = None
-        self.best_evaluation = None
+        self.withMaterial = withMaterial
 
     def next_move(self, opponent_move: chess.Move) -> chess.Move:
         if opponent_move:
             self.board.push(opponent_move)
 
-        self.best_move = None
-        self.best_evaluation = None
+        best_move = None
+        best_evaluation = None
 
         for move in self.board.legal_moves:
             self.board.push(move)
+            if self.board.is_checkmate():
+                return move
             evaluation = self.__evaluate(self.board.fen())
-            if self.best_evaluation is None or self.best_evaluation < evaluation:
-                self.best_evaluation = evaluation
-                self.best_move = move
+            # evaluation += np.random.uniform(-0.1, 0.1)
+            if self.withMaterial:
+                evaluation += MaterialEngine.material_balance(self.board) / 15
+            if not self.isWhite:
+                evaluation *= -1
+            if best_evaluation is None or best_evaluation < evaluation:
+                best_evaluation = evaluation
+                best_move = move
             self.board.pop()
 
-        self.board.push(self.best_move)
-        return self.best_move
+        self.board.push(best_move)
+        return best_move
 
-    def reset(self):
-        self.board = chess.Board()
+    def reset(self, fen: str):
+        self.board = chess.Board(fen)
 
-    def __evaluate(self, position):
-        X = fen_to_bitboard(position, merge_colors=True)
+    def __evaluate(self, fen):
+        X = fen_to_bitboard(fen, merge_colors=False)
         X = torch.from_numpy(X).float()
         X = X.unsqueeze(0)
         y = self.model(X).to("cpu")
         return y.detach().numpy()[0][0]
 
 
-class StockfishEngine:
+class MaterialEngine(Engine):
+    def __init__(self, isWhite: bool):
+        super().__init__("Material Engine")
+        self.isWhite = isWhite
+        self.board = chess.Board()
+
+    def next_move(self, opponent_move: chess.Move) -> chess.Move:
+        if opponent_move:
+            self.board.push(opponent_move)
+
+        best_evaluation = None
+        best_move = None
+
+        for move in self.board.legal_moves:
+            self.board.push(move)
+            if self.board.is_checkmate():
+                return move
+            evaluation = self.material_balance(self.board) + np.random.uniform(-1, 1)
+            if not self.isWhite:
+                evaluation *= -1
+            if best_evaluation is None or best_evaluation < evaluation:
+                best_evaluation = evaluation
+                best_move = move
+            self.board.pop()
+
+        self.board.push(best_move)
+        return best_move
+
+    @staticmethod
+    def material_balance(board):
+        white = board.occupied_co[chess.WHITE]
+        black = board.occupied_co[chess.BLACK]
+        # fmt: off
+        return (
+            chess.popcount(white & board.pawns) - chess.popcount(black & board.pawns)
+            + 3 * (chess.popcount(white & board.knights) - chess.popcount(black & board.knights))
+            + 3 * (chess.popcount(white & board.bishops) - chess.popcount(black & board.bishops))
+            + 5 * (chess.popcount(white & board.rooks) - chess.popcount(black & board.rooks))
+            + 9 * (chess.popcount(white & board.queens) - chess.popcount(black & board.queens))
+        # fmt: on
+        )
+
+    def reset(self, fen: str):
+        self.board = chess.Board(fen)
+
+
+class StockfishEngine(Engine):
     # API: https://disservin.github.io/stockfish-docs/stockfish-wiki/UCI-&-Commands.html
-    def __init__(self, elo: int):
+    def __init__(self, elo: int, depth: int = 15):
+        super().__init__(f"Stockfish {elo} ({depth})")
         self.elo = elo
         self.stockfish = Stockfish(
-            path="./engines/stockfish/stockfish-windows-x86-64-avx2.exe"
+            path=r"D:\\chess-ai\\engines\\stockfish\\stockfish-windows-x86-64-avx2.exe",
+            depth=depth,
+            parameters={"MultiPV": 10, "Skill Level": 0},
         )
         self.stockfish.set_elo_rating(elo)
 
@@ -72,45 +161,39 @@ class StockfishEngine:
 
 class Game:
     def __init__(
-        self, stockfish_elo: int = 1320
+        self, engine1: Engine, engine2: Engine
     ):  # stockfish documentation says: type spin default 1320 min 1320 max 3190
         self.board = chess.Board()
-        self.stockfish = StockfishEngine(stockfish_elo)
-        self.custom = NeuralEngine()
+        self.round = 0
+        self.engines = [engine1, engine2]
 
-    def play(self, starts: Literal["stockfish", "custom"]) -> chess.pgn.Game:
+    def play(self, starts: Literal[0, 1]) -> chess.pgn.Game:
+        self.round += 1
         turn = starts
         move = None
         while not (self.board.is_checkmate() or self.board.is_stalemate()):
-            if turn == "stockfish":
-                move = self.stockfish.next_move(move)
-                turn = "custom"
-            else:
-                move = self.custom.next_move(move)
-                turn = "stockfish"
-
+            if self.board.outcome():
+                print("--- ", self.board.outcome())
+                break
+            current_engine = self.engines[0] if turn % 2 == starts else self.engines[1]
+            move = current_engine.next_move(move)
+            turn += 1
             self.board.push(move)
 
         game = chess.pgn.Game.from_board(self.board)
-
-        game.headers["Event"] = f"Pojedynek ze Stockfishem {self.stockfish.elo}"
+        game.headers["Event"] = f"{self.engines[0].name} vs {self.engines[1].name}"
         game.headers["Site"] = "Arena"
-
-        if starts == "stockfish":
-            game.headers["White"] = "Stockfish"
-            game.headers["Black"] = "Custom"
-        else:
-            game.headers["White"] = "Custom"
-            game.headers["Black"] = "Stockfish"
+        game.headers["Date"] = datetime.datetime.now().strftime("%Y.%m.%d")
+        game.headers["Round"] = self.round
+        game.headers["White"] = self.engines[starts].name
+        game.headers["Black"] = self.engines[(starts + 1) % 2].name
 
         return game, self.board.outcome(), len(self.board.move_stack)
 
     def reset(self):
         self.board = chess.Board()
-        self.custom.reset()
-
-        fen_start = self.board.fen()
-        self.stockfish.reset(fen_start)
+        self.engines[0].reset(chess.STARTING_FEN)
+        self.engines[1].reset(chess.STARTING_FEN)
 
     @staticmethod
     def save(game: chess.pgn.Game, path: str):
@@ -129,18 +212,36 @@ if __name__ == "__main__":
     except OSError as error:
         print(f"Directory {directory} already exists")
 
-    game_simulator = Game(stockfish_elo=600)
+    # e1, e2 = RandomEngine(), NeuralEngine(False, True)
+    # e1, e2 = MaterialEngine(True), NeuralEngine(False, False)
+    # e1, e2 = NeuralEngine(True, False), NeuralEngine(False, False)
+    e1, e2 = StockfishEngine(1320, 1), NeuralEngine(False, False)
+    game_simulator = Game(e1, e2)
+    scores = [0, 0]
+    timeouts = 0
 
-    for i in range(10):
+    for i in range(30):
         t0 = time()
-        p1, p2 = "custom", "stockfish"
-        game, outcome, moves = game_simulator.play(p1)
-        winner = p1 if outcome.winner == chess.WHITE else p2
-        print(f"Game {i+1:2} took {time() - t0:.3}s - {winner} won in {moves} moves")
-
-        file = f"game_{i+1}.pgn"
-        Game.save(game, os.path.join(directory, file))
-
+        out = game_simulator.play(starts=0)
+        if out:
+            game, outcome, moves = out
+            winner = "No one"
+            if outcome is not None and outcome.winner is not None:
+                winner = e1.name if outcome.winner == chess.WHITE else e2.name
+                if outcome.winner in [chess.WHITE, chess.BLACK]:
+                    scores[int(outcome.winner == chess.BLACK)] += 1
+                    print(
+                        f"Game {i+1:2} took {time() - t0:.3}s - {winner} won in {moves} moves"
+                    )
+            else:
+                timeouts += 1
+            if game:
+                file = f"game_{i+1}.pgn"
+                Game.save(game, os.path.join(directory, file))
         game_simulator.reset()
+    print("----------------------")
+    print(
+        f"End score\n{e1.name}: {scores[0]}\n{e2.name}: {scores[1]}\nTimeouts: {timeouts}"
+    )
 
 # Upload game here to see game evaluation https://lichess.org/paste
